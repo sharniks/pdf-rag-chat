@@ -5,7 +5,9 @@ from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
 import pickle
-
+from rank_bm25 import BM25Okapi
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+import glob
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
@@ -14,15 +16,45 @@ import pickle
 logging.basicConfig(level=logging.INFO)
 
 # Path of the input PDF document
-DATA_PATH = "./data/Sample-Java.pdf"
+DATA_DIR = "./data"
 
 # Location where FAISS vector index will be stored
 INDEX_PATH = "./vectorstore/faiss_index"
 
 
+class PDFExtractionError(Exception):
+    """Raised when a PDF cannot be read or extracted."""
+    pass
+
+
+def extract_pages_from_pdf(path):
+    """
+    Reads a PDF and returns a list of (page_num, page_text) tuples.
+    Raises PDFExtractionError instead of silently returning None,
+    so the caller can distinguish "missing file" from "corrupt PDF"
+    - similar to throwing a checked FileNotFoundException vs an
+    IOException in Java rather than returning null for both.
+    """
+    if not os.path.exists(path):
+        raise PDFExtractionError(f"PDF file not found at path: {path}")
+
+    try:
+        pdf_document = fitz.open(path)
+        pages = []
+        for page_num in range(len(pdf_document)):
+            page = pdf_document.load_page(page_num)
+            pages.append((page_num + 1, page.get_text()))
+        pdf_document.close()
+        logging.info(f"Extracted {len(pages)} pages from {path}")
+        return pages
+    except Exception as e:
+        raise PDFExtractionError(f"Error processing PDF {path}: {e}") from e
+
 # -----------------------------------------------------------------------------
 # Step 1 : Extract text from PDF
 # -----------------------------------------------------------------------------
+
+
 def extract_text_from_pdf(path):
     """
     Reads a PDF file and extracts text from every page.
@@ -82,84 +114,46 @@ def extract_text_from_pdf(path):
 # -----------------------------------------------------------------------------
 # Step 2 : Split text into smaller chunks
 # -----------------------------------------------------------------------------
-def chunk_text(text, chunk_size=500, overlap=50):
+def build_chunks_from_directory(data_dir=DATA_DIR, chunk_size=500, chunk_overlap=50):
     """
-    Splits a large text into overlapping chunks.
-
-    Why overlap?
-    ------------
-    Overlap preserves context between consecutive chunks.
-    Without overlap, important information at chunk boundaries
-    may be lost.
-
-    Example:
-        Chunk 1 : ABCDEFGHIJ
-        Chunk 2 : HIJKLMNOPQ
-
-    Parameters
-    ----------
-    text : str
-        Complete extracted text.
-
-    chunk_size : int
-        Maximum characters in one chunk.
-
-    overlap : int
-        Number of characters shared between adjacent chunks.
-
-    Returns
-    -------
-    list
-        List of text chunks.
+    Loops over every PDF in data_dir and returns a list of dicts:
+    {"text": ..., "source": ..., "page": ...}
+    This is your unit of retrieval from here on — not a bare string.
+    Think of it like a small DTO/record instead of passing a raw String
+    around and hoping everyone remembers what it represents.
     """
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
 
-    chunks = []
-    start = 0
+    all_chunks = []
+    pdf_paths = glob.glob(os.path.join(data_dir, "*.pdf"))
 
-    while start < len(text):
+    if not pdf_paths:
+        raise PDFExtractionError(f"No PDF files found in {data_dir}")
 
-        # End position of current chunk
-        end = start + chunk_size
+    for path in pdf_paths:
+        pages = extract_pages_from_pdf(path)  # raises on failure, no silent None
+        for page_num, page_text in pages:
+            for chunk_text in splitter.split_text(page_text):
+                all_chunks.append({
+                    "text": chunk_text,
+                    "source": os.path.basename(path),
+                    "page": page_num,
+                })
 
-        # Extract the chunk
-        chunks.append(text[start:end])
-
-        # Move start position while keeping overlap
-        start += chunk_size - overlap
-
-    return chunks
+    logging.info(f"Total chunks created: {len(all_chunks)} from {len(pdf_paths)} PDF(s)")
+    return all_chunks
 
 
 # -----------------------------------------------------------------------------
 # Step 3 : Generate embeddings
 # -----------------------------------------------------------------------------
 def create_embeddings(chunks):
-    """
-    Converts text chunks into numerical vectors (embeddings).
-
-    These vectors capture semantic meaning so that similar texts
-    are located close together in vector space.
-
-    Model used:
-        all-MiniLM-L6-v2
-
-    Returns
-    -------
-    numpy.ndarray
-        Embedding vector for each chunk.
-    """
-
-    # Load SentenceTransformer model
-    # (Downloads automatically the first time)
+    texts = [c["text"] for c in chunks]
     model = SentenceTransformer("all-MiniLM-L6-v2")
-
-    # Generate embedding for every chunk
-    vectors = model.encode(
-        chunks,
-        show_progress_bar=True
-    )
-
-    return vectors
+    return model.encode(texts, show_progress_bar=True)
 
 
 # -----------------------------------------------------------------------------
@@ -208,29 +202,25 @@ def save_faiss_index(embeddings, chunks, index_path=INDEX_PATH):
     logging.info(f"FAISS index saved at {index_path}")
 
 
+# Build once at ingest time, save alongside the FAISS index
+def build_bm25_index(chunks):
+    tokenized = [c["text"].lower().split() for c in chunks]
+    return BM25Okapi(tokenized)
+
+
 # -----------------------------------------------------------------------------
 # Main Execution
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
+    chunks = build_chunks_from_directory()
 
-    # Step 1 : Read PDF
-    text = extract_text_from_pdf(DATA_PATH)
-
-    # Stop execution if PDF extraction failed
-    if text is None:
-        raise ValueError("Failed to extract text from PDF.")
-
-    # Step 2 : Split into chunks
-    chunks = chunk_text(text)
-
-    logging.info(f"Total chunks created: {len(chunks)}")
-
-    # Step 3 : Convert chunks into embeddings
     embeddings = create_embeddings(chunks)
-
     logging.info(f"Embedding shape: {embeddings.shape}")
 
-    # Step 4 : Store vectors in FAISS
     save_faiss_index(np.array(embeddings), chunks)
+
+    bm25 = build_bm25_index(chunks)
+    with open(INDEX_PATH + "_bm25.pkl", "wb") as f:
+        pickle.dump(bm25, f)
 
     logging.info("Vector database created successfully.")

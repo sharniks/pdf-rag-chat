@@ -6,6 +6,7 @@ import ollama
 from dotenv import load_dotenv
 import os
 import requests
+from sentence_transformers import CrossEncoder
 
 # -----------------------------------------------------------------------------
 # Load environment variables (.env file)
@@ -16,76 +17,41 @@ load_dotenv()
 # Path where the FAISS index was created during the ingestion process.
 INDEX_PATH = "./vectorstore/faiss_index"
 
-# -----------------------------------------------------------------------------
-# Step 1 : Load FAISS Index
-# -----------------------------------------------------------------------------
-# The FAISS index contains only vector embeddings.
-# It does NOT contain the original text.
-index = faiss.read_index(INDEX_PATH)
-
-# -----------------------------------------------------------------------------
-# Step 2 : Load Chunk Mapping
-# -----------------------------------------------------------------------------
-# During ingestion, we stored the original text chunks separately
-# in a pickle file.
-#
-# Why?
-# FAISS only returns vector IDs after searching.
-# We need this mapping to convert those IDs back into readable text.
-with open(INDEX_PATH + "_mapping.pkl", "rb") as f:
-    chunks = pickle.load(f)
-
-# -----------------------------------------------------------------------------
-# Step 3 : Load Embedding Model
-# -----------------------------------------------------------------------------
-# IMPORTANT:
-# Always use the SAME embedding model that was used while
-# creating the FAISS index.
-#
-# If a different model is used, the embeddings will exist in a
-# different vector space and similarity search will fail.
-model = SentenceTransformer("all-MiniLM-L6-v2")
+USE_LOCAL_LLM = os.getenv("USE_LOCAL_LLM", "true").lower() == "false"
 
 
-# -----------------------------------------------------------------------------
-# Retrieve Relevant Context
-# -----------------------------------------------------------------------------
-def retrieve_context(query, k=3):
+def load_index(index_path=INDEX_PATH):
     """
-    Retrieves the top-k most relevant text chunks
-    for the user's question.
-
-    Parameters
-    ----------
-    query : str
-        User question.
-
-    k : int
-        Number of similar chunks to retrieve.
-
-    Returns
-    -------
-    list
-        Top-k matching text chunks.
+    Loads FAISS index, chunk metadata, and BM25 index together.
+    Called explicitly from main() rather than at import time, so
+    this module can be imported (e.g. by a test file or another
+    script) without side effects — same idea as lazy-initializing
+    a Spring bean instead of doing work in a static block.
     """
+    index = faiss.read_index(index_path)
+    with open(index_path + "_mapping.pkl", "rb") as f:
+        chunks = pickle.load(f)
+    with open(index_path + "_bm25.pkl", "rb") as f:
+        bm25 = pickle.load(f)
+    return index, chunks, bm25
 
-    # Convert the user query into an embedding vector.
-    query_embedding = model.encode([query])
 
-    # FAISS expects float32 vectors.
-    query_embedding = np.array(query_embedding).astype("float32")
+_embed_model = None
+_reranker = None
 
-    # Search FAISS for the nearest vectors.
-    #
-    # Returns:
-    # distances -> similarity scores
-    # indices   -> IDs of matching chunks
-    distances, indices = index.search(query_embedding, k)
 
-    # Retrieve original text using chunk IDs.
-    results = [chunks[i] for i in indices[0]]
+def get_embed_model():
+    global _embed_model
+    if _embed_model is None:
+        _embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+    return _embed_model
 
-    return results
+
+def get_reranker():
+    global _reranker
+    if _reranker is None:
+        _reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    return _reranker
 
 
 # -----------------------------------------------------------------------------
@@ -234,11 +200,54 @@ def ask_ollama(query, context):
 
     return response["message"]["content"]
 
+# At query time
+
+
+def retrieve_context(index, chunks, query, k=15):
+    query_embedding = get_embed_model().encode([query])
+    query_embedding = np.array(query_embedding).astype("float32")
+    distances, indices = index.search(query_embedding, k)
+    return [chunks[i] for i in indices[0]]
+
+
+def bm25_search(bm25, chunks, query, k=15):
+    scores = bm25.get_scores(query.lower().split())
+    top_idx = np.argsort(scores)[::-1][:k]
+    return [(chunks[i], scores[i]) for i in top_idx]
+
+
+def reciprocal_rank_fusion(dense_results, bm25_results, k=60):
+    scores = {}
+    lookup = {}
+
+    def key(c):
+        return (c["source"], c["page"], c["text"])
+
+    for rank, chunk in enumerate(dense_results):
+        ck = key(chunk)
+        scores[ck] = scores.get(ck, 0) + 1 / (k + rank + 1)
+        lookup[ck] = chunk
+    for rank, (chunk, _) in enumerate(bm25_results):
+        ck = key(chunk)
+        scores[ck] = scores.get(ck, 0) + 1 / (k + rank + 1)
+        lookup[ck] = chunk
+
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return [lookup[ck] for ck, _ in ranked]
+
+
+def rerank(query, candidates, top_k=3):
+    pairs = [(query, c["text"]) for c in candidates]
+    scores = get_reranker().predict(pairs)
+    ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
+    return [chunk for chunk, _ in ranked[:top_k]]
+
 
 # -----------------------------------------------------------------------------
 # Main Program
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
+    index, chunks, bm25 = load_index()
 
     while True:
 
@@ -250,22 +259,27 @@ if __name__ == "__main__":
             break
 
         # ---------------------------------------------------------
-        # Step 1 : Retrieve relevant document chunks.
+        # Step 1 : Hybrid retrieval — dense + keyword
         # ---------------------------------------------------------
-        top_chunks = retrieve_context(q, k=3)
+        dense_chunks = retrieve_context(index, chunks, q, k=15)
+        bm25_chunks = bm25_search(bm25, chunks, q, k=15)
+        fused = reciprocal_rank_fusion(dense_chunks, bm25_chunks)
+        top_chunks = rerank(q, fused[:15], top_k=3)
 
-        # Merge retrieved chunks into one context.
-        combined_context = "\n\n".join(top_chunks)
+        # ---------------------------------------------------------
+        # Step 2 : Cross-encoder rerank down to final top-k
+        # ---------------------------------------------------------
+        combined_context = "\n\n".join(c["text"] for c in top_chunks)
 
         # ---------------------------------------------------------
         # Step 2 : Send context + question to LLM.
         # ---------------------------------------------------------
 
-        # Local LLM
-        # answer = ask_ollama(q, combined_context)
-
         # Hugging Face Hosted LLM
-        answer = ask_hf(q, combined_context)
+        if USE_LOCAL_LLM:
+            answer = ask_ollama(q, combined_context)
+        else:
+            answer = ask_hf(q, combined_context)
 
         # ---------------------------------------------------------
         # Step 3 : Display response.
@@ -273,6 +287,13 @@ if __name__ == "__main__":
         print("\nAnswer:")
         print(answer)
 
+        print("\nSources:")
+        seen = set()
+        for c in top_chunks:
+            key = (c["source"], c["page"])
+            if key not in seen:
+                seen.add(key)
+                print(f"  - {c['source']}, page {c['page']}")
         # ---------------------------------------------------------
         # Debugging (Optional)
         # Shows which chunks were retrieved.
