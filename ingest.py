@@ -1,13 +1,12 @@
 import fitz  # PyMuPDF library for reading PDF files
 import os
+import glob
 import logging
 from sentence_transformers import SentenceTransformer
-import faiss
-import numpy as np
-import pickle
-from rank_bm25 import BM25Okapi
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-import glob
+
+import storage
+
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
@@ -15,11 +14,8 @@ import glob
 # Configure logging so that INFO and ERROR messages are printed on console.
 logging.basicConfig(level=logging.INFO)
 
-# Path of the input PDF document
+# Directory scanned by the CLI entry point below for bulk (re-)ingestion.
 DATA_DIR = "./data"
-
-# Location where FAISS vector index will be stored
-INDEX_PATH = "./vectorstore/faiss_index"
 
 
 class PDFExtractionError(Exception):
@@ -27,124 +23,62 @@ class PDFExtractionError(Exception):
     pass
 
 
+def _extract_pages(pdf_document):
+    pages = []
+    for page_num in range(len(pdf_document)):
+        page = pdf_document.load_page(page_num)
+        pages.append((page_num + 1, page.get_text()))
+    return pages
+
+
 def extract_pages_from_pdf(path):
     """
-    Reads a PDF and returns a list of (page_num, page_text) tuples.
-    Raises PDFExtractionError instead of silently returning None,
-    so the caller can distinguish "missing file" from "corrupt PDF"
-    - similar to throwing a checked FileNotFoundException vs an
-    IOException in Java rather than returning null for both.
+    Reads a PDF from disk and returns a list of (page_num, page_text) tuples.
+    Raises PDFExtractionError instead of silently returning None, so the
+    caller can distinguish "missing file" from "corrupt PDF".
     """
     if not os.path.exists(path):
         raise PDFExtractionError(f"PDF file not found at path: {path}")
 
     try:
         pdf_document = fitz.open(path)
-        pages = []
-        for page_num in range(len(pdf_document)):
-            page = pdf_document.load_page(page_num)
-            pages.append((page_num + 1, page.get_text()))
+        pages = _extract_pages(pdf_document)
         pdf_document.close()
         logging.info(f"Extracted {len(pages)} pages from {path}")
         return pages
     except Exception as e:
         raise PDFExtractionError(f"Error processing PDF {path}: {e}") from e
 
-# -----------------------------------------------------------------------------
-# Step 1 : Extract text from PDF
-# -----------------------------------------------------------------------------
 
-
-def extract_text_from_pdf(path):
-    """
-    Reads a PDF file and extracts text from every page.
-
-    Parameters
-    ----------
-    path : str
-        Path to the PDF document.
-
-    Returns
-    -------
-    str
-        Combined text from all pages.
-        Returns None if the file does not exist or an error occurs.
-    """
-
-    # Verify that the PDF exists before attempting to open it.
-    if os.path.exists(path):
-        try:
-            # Open PDF document
-            pdf_document = fitz.open(path)
-
-            # Stores text extracted from each page
-            all_text = []
-
-            # Iterate through every page in the PDF
-            for page_num in range(len(pdf_document)):
-
-                # Load one page at a time
-                page = pdf_document.load_page(page_num)
-
-                # Extract plain text from the page
-                text = page.get_text()
-
-                # Store page text
-                all_text.append(text)
-
-            # Always close the PDF after processing
-            pdf_document.close()
-
-            logging.info(
-                f"PDF loaded successfully. Extracted {len(all_text)} pages."
-            )
-
-            # Merge all page texts into one large string
-            return "\n".join(all_text)
-
-        except Exception as e:
-            logging.error(f"Error processing PDF: {e}")
-
-    else:
-        logging.error(f"PDF file not found at path: {path}")
-
-    return None
+def extract_pages_from_bytes(file_bytes, filename="<uploaded>"):
+    """Same as extract_pages_from_pdf, but for in-memory PDF bytes (e.g. an upload)."""
+    try:
+        pdf_document = fitz.open(stream=file_bytes, filetype="pdf")
+        pages = _extract_pages(pdf_document)
+        pdf_document.close()
+        logging.info(f"Extracted {len(pages)} pages from {filename}")
+        return pages
+    except Exception as e:
+        raise PDFExtractionError(f"Error processing PDF {filename}: {e}") from e
 
 
 # -----------------------------------------------------------------------------
 # Step 2 : Split text into smaller chunks
 # -----------------------------------------------------------------------------
-def build_chunks_from_directory(data_dir=DATA_DIR, chunk_size=500, chunk_overlap=50):
+def chunk_pages(pages, chunk_size=500, chunk_overlap=50):
     """
-    Loops over every PDF in data_dir and returns a list of dicts:
-    {"text": ..., "source": ..., "page": ...}
-    This is your unit of retrieval from here on — not a bare string.
-    Think of it like a small DTO/record instead of passing a raw String
-    around and hoping everyone remembers what it represents.
+    Splits a list of (page_num, page_text) tuples into {"page", "text"} dicts.
+    This is the unit of retrieval from here on — not a bare string.
     """
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
     )
-
-    all_chunks = []
-    pdf_paths = glob.glob(os.path.join(data_dir, "*.pdf"))
-
-    if not pdf_paths:
-        raise PDFExtractionError(f"No PDF files found in {data_dir}")
-
-    for path in pdf_paths:
-        pages = extract_pages_from_pdf(path)  # raises on failure, no silent None
-        for page_num, page_text in pages:
-            for chunk_text in splitter.split_text(page_text):
-                all_chunks.append({
-                    "text": chunk_text,
-                    "source": os.path.basename(path),
-                    "page": page_num,
-                })
-
-    logging.info(f"Total chunks created: {len(all_chunks)} from {len(pdf_paths)} PDF(s)")
-    return all_chunks
+    chunks = []
+    for page_num, page_text in pages:
+        for chunk_text in splitter.split_text(page_text):
+            chunks.append({"page": page_num, "text": chunk_text})
+    return chunks
 
 
 # -----------------------------------------------------------------------------
@@ -157,70 +91,44 @@ def create_embeddings(chunks):
 
 
 # -----------------------------------------------------------------------------
-# Step 4 : Save embeddings into FAISS
+# Step 4 : Ingest one document end-to-end (used by both the CLI below and app.py)
 # -----------------------------------------------------------------------------
-def save_faiss_index(embeddings, chunks, index_path=INDEX_PATH):
+def ingest_single_document(filename, file_bytes):
     """
-    Creates a FAISS index from embeddings and saves it to disk.
+    Stores the document's bytes, extracts/chunks/embeds its text, and adds
+    the chunks + embeddings to the shared storage layer.
 
-    Also stores a mapping between vector index and original text
-    so retrieved vectors can be converted back into readable text.
-
-    Parameters
-    ----------
-    embeddings : numpy.ndarray
-        Embedding vectors.
-
-    chunks : list
-        Original text chunks.
-
-    index_path : str
-        Destination path for FAISS index.
+    Returns the new document id, or None if this exact file was already
+    ingested (detected by content hash in storage.add_document).
     """
+    doc_id = storage.add_document(filename, file_bytes)
+    if doc_id is None:
+        logging.info(f"Skipping duplicate file: {filename}")
+        return None
 
-    # Embedding dimension (e.g. 384 for MiniLM)
-    dim = embeddings.shape[1]
+    pages = extract_pages_from_bytes(file_bytes, filename)
+    chunks = chunk_pages(pages)
+    if chunks:
+        embeddings = create_embeddings(chunks)
+        storage.add_chunks_and_embed(doc_id, chunks, embeddings)
 
-    # Create a simple FAISS index using L2 (Euclidean) distance.
-    # This index performs exact nearest-neighbor search.
-    index = faiss.IndexFlatL2(dim)
-
-    # Add all embedding vectors into the index
-    index.add(embeddings)
-
-    # Create directory if it doesn't exist
-    os.makedirs(os.path.dirname(index_path), exist_ok=True)
-
-    # Save FAISS index to disk
-    faiss.write_index(index, index_path)
-
-    # Save original text chunks separately.
-    # FAISS stores vectors only, not the original text.
-    with open(index_path + "_mapping.pkl", "wb") as f:
-        pickle.dump(chunks, f)
-
-    logging.info(f"FAISS index saved at {index_path}")
-
-
-# Build once at ingest time, save alongside the FAISS index
-def build_bm25_index(chunks):
-    tokenized = [c["text"].lower().split() for c in chunks]
-    return BM25Okapi(tokenized)
+    logging.info(f"Ingested {filename}: {len(chunks)} chunks")
+    return doc_id
 
 
 # -----------------------------------------------------------------------------
-# Main Execution
+# Main Execution — bulk-ingest every PDF in DATA_DIR
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    chunks = build_chunks_from_directory()
+    storage.init_db()
 
-    embeddings = create_embeddings(chunks)
-    logging.info(f"Embedding shape: {embeddings.shape}")
+    pdf_paths = glob.glob(os.path.join(DATA_DIR, "*.pdf"))
+    if not pdf_paths:
+        raise PDFExtractionError(f"No PDF files found in {DATA_DIR}")
 
-    save_faiss_index(np.array(embeddings), chunks)
+    for path in pdf_paths:
+        with open(path, "rb") as f:
+            file_bytes = f.read()
+        ingest_single_document(os.path.basename(path), file_bytes)
 
-    bm25 = build_bm25_index(chunks)
-    with open(INDEX_PATH + "_bm25.pkl", "wb") as f:
-        pickle.dump(bm25, f)
-
-    logging.info("Vector database created successfully.")
+    logging.info("Ingestion complete.")

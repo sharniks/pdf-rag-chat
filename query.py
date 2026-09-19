@@ -1,6 +1,4 @@
-import faiss
 import numpy as np
-import pickle
 from sentence_transformers import SentenceTransformer
 import ollama
 from dotenv import load_dotenv
@@ -8,32 +6,15 @@ import os
 import requests
 from sentence_transformers import CrossEncoder
 
+import storage
+
 # -----------------------------------------------------------------------------
 # Load environment variables (.env file)
 # -----------------------------------------------------------------------------
 # Used for securely storing secrets like Hugging Face API token.
 load_dotenv()
 
-# Path where the FAISS index was created during the ingestion process.
-INDEX_PATH = "./vectorstore/faiss_index"
-
 USE_LOCAL_LLM = os.getenv("USE_LOCAL_LLM", "true").lower() == "false"
-
-
-def load_index(index_path=INDEX_PATH):
-    """
-    Loads FAISS index, chunk metadata, and BM25 index together.
-    Called explicitly from main() rather than at import time, so
-    this module can be imported (e.g. by a test file or another
-    script) without side effects — same idea as lazy-initializing
-    a Spring bean instead of doing work in a static block.
-    """
-    index = faiss.read_index(index_path)
-    with open(index_path + "_mapping.pkl", "rb") as f:
-        chunks = pickle.load(f)
-    with open(index_path + "_bm25.pkl", "rb") as f:
-        bm25 = pickle.load(f)
-    return index, chunks, bm25
 
 
 _embed_model = None
@@ -144,6 +125,7 @@ def ask_hf(
         json=payload,
         timeout=120
     )
+    response.raise_for_status()
 
     # Convert JSON response into Python dictionary.
     result = response.json()
@@ -203,37 +185,45 @@ def ask_ollama(query, context):
 # At query time
 
 
-def retrieve_context(index, chunks, query, k=15):
+def retrieve_context(index, query, k=15):
+    """Dense FAISS search. `index` is an IndexIDMap, so returned ids are chunk ids."""
     query_embedding = get_embed_model().encode([query])
     query_embedding = np.array(query_embedding).astype("float32")
-    distances, indices = index.search(query_embedding, k)
-    return [chunks[i] for i in indices[0]]
+    _distances, indices = index.search(query_embedding, k)
+    ids = [int(i) for i in indices[0] if i != -1]
+    return storage.get_chunks_by_ids(ids)
 
 
-def bm25_search(bm25, chunks, query, k=15):
+def bm25_search(bm25, chunk_ids, query, k=15):
+    """Keyword search. `chunk_ids` maps BM25's positional scores back to chunk ids."""
+    if bm25 is None or not chunk_ids:
+        return []
     scores = bm25.get_scores(query.lower().split())
     top_idx = np.argsort(scores)[::-1][:k]
-    return [(chunks[i], scores[i]) for i in top_idx]
+    top_ids = [chunk_ids[i] for i in top_idx]
+    chunks_by_id = {c["id"]: c for c in storage.get_chunks_by_ids(top_ids)}
+    return [
+        (chunks_by_id[chunk_ids[i]], scores[i])
+        for i in top_idx
+        if chunk_ids[i] in chunks_by_id
+    ]
 
 
 def reciprocal_rank_fusion(dense_results, bm25_results, k=60):
     scores = {}
     lookup = {}
 
-    def key(c):
-        return (c["source"], c["page"], c["text"])
-
     for rank, chunk in enumerate(dense_results):
-        ck = key(chunk)
-        scores[ck] = scores.get(ck, 0) + 1 / (k + rank + 1)
-        lookup[ck] = chunk
+        cid = chunk["id"]
+        scores[cid] = scores.get(cid, 0) + 1 / (k + rank + 1)
+        lookup[cid] = chunk
     for rank, (chunk, _) in enumerate(bm25_results):
-        ck = key(chunk)
-        scores[ck] = scores.get(ck, 0) + 1 / (k + rank + 1)
-        lookup[ck] = chunk
+        cid = chunk["id"]
+        scores[cid] = scores.get(cid, 0) + 1 / (k + rank + 1)
+        lookup[cid] = chunk
 
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    return [lookup[ck] for ck, _ in ranked]
+    return [lookup[cid] for cid, _ in ranked]
 
 
 def rerank(query, candidates, top_k=3):
@@ -247,7 +237,9 @@ def rerank(query, candidates, top_k=3):
 # Main Program
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    index, chunks, bm25 = load_index()
+    storage.init_db()
+    index = storage.load_or_init_faiss_index()
+    bm25, chunk_ids = storage.load_bm25()
 
     while True:
 
@@ -261,28 +253,30 @@ if __name__ == "__main__":
         # ---------------------------------------------------------
         # Step 1 : Hybrid retrieval — dense + keyword
         # ---------------------------------------------------------
-        dense_chunks = retrieve_context(index, chunks, q, k=15)
-        bm25_chunks = bm25_search(bm25, chunks, q, k=15)
+        dense_chunks = retrieve_context(index, q, k=15)
+        bm25_chunks = bm25_search(bm25, chunk_ids, q, k=15)
         fused = reciprocal_rank_fusion(dense_chunks, bm25_chunks)
-        top_chunks = rerank(q, fused[:15], top_k=3)
+
+        if not fused:
+            print("\nAnswer:\nI don't know. No documents have been ingested yet.")
+            continue
 
         # ---------------------------------------------------------
         # Step 2 : Cross-encoder rerank down to final top-k
         # ---------------------------------------------------------
+        top_chunks = rerank(q, fused[:15], top_k=3)
         combined_context = "\n\n".join(c["text"] for c in top_chunks)
 
         # ---------------------------------------------------------
-        # Step 2 : Send context + question to LLM.
+        # Step 3 : Send context + question to LLM.
         # ---------------------------------------------------------
-
-        # Hugging Face Hosted LLM
         if USE_LOCAL_LLM:
             answer = ask_ollama(q, combined_context)
         else:
             answer = ask_hf(q, combined_context)
 
         # ---------------------------------------------------------
-        # Step 3 : Display response.
+        # Step 4 : Display response.
         # ---------------------------------------------------------
         print("\nAnswer:")
         print(answer)
@@ -294,11 +288,3 @@ if __name__ == "__main__":
             if key not in seen:
                 seen.add(key)
                 print(f"  - {c['source']}, page {c['page']}")
-        # ---------------------------------------------------------
-        # Debugging (Optional)
-        # Shows which chunks were retrieved.
-        # Useful for understanding why the LLM answered a certain way.
-        # ---------------------------------------------------------
-        # print("\nRetrieved Chunks:\n")
-        # for i, chunk in enumerate(top_chunks, start=1):
-        #     print(f"{i}. {chunk[:200]}...")

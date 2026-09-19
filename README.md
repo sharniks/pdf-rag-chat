@@ -1,8 +1,8 @@
 # 📄 PDF RAG Chat
 
-A simple Retrieval-Augmented Generation (RAG) application that allows you to ask questions about a PDF document from the terminal.
+A Retrieval-Augmented Generation (RAG) application that lets you upload PDFs through a web UI and ask questions about them.
 
-The application extracts text from a PDF, generates embeddings, stores them in a FAISS vector database, and retrieves relevant context to answer user queries.
+Uploaded files are stored in SQLite, chunked and embedded, indexed in FAISS (dense) and BM25 (keyword) for hybrid retrieval, reranked with a cross-encoder, and answered by a local or hosted LLM with source citations.
 
 This project was built as part of my AI Engineering learning journey to understand the fundamentals of Retrieval-Augmented Generation (RAG).
 
@@ -10,22 +10,26 @@ This project was built as part of my AI Engineering learning journey to understa
 
 ## ✨ Features
 
-- 📄 Load PDF documents
+- 📤 Upload PDFs from the browser (Streamlit), stored in SQLite — no manual file placement needed
 - ✂️ Automatic text chunking
 - 🧠 Generate embeddings
-- 🗂️ Store embeddings using FAISS
-- 💬 Ask questions about the document
-- 💻 Simple terminal-based interface
+- 🔀 Hybrid retrieval (FAISS dense + BM25 keyword search) with reciprocal rank fusion
+- 🎯 Cross-encoder reranking
+- 📚 Multiple PDFs, with per-document delete
+- 📎 Source citations (file + page) with every answer
+- 💬 Chat UI, plus a terminal CLI alternative
 
 ---
 
 ## 🛠️ Tech Stack
 
 - Python
-- LangChain
-- Hugging Face
-- FAISS
-- Sentence Transformers / Embedding Model
+- Streamlit
+- LangChain (text splitting)
+- Hugging Face / Ollama
+- FAISS + BM25 (rank_bm25)
+- Sentence Transformers (embeddings + cross-encoder reranking)
+- SQLite
 - Python Dotenv
 
 ---
@@ -69,37 +73,22 @@ Create a `.env` file in the project root.
 HF_API_TOKEN=your_huggingface_api_token
 ```
 
-### Add your PDF
-
-Place the PDF inside the `data/` directory.
-
-Example:
-
-```
-data/
-└── sample.pdf
-```
-
-### Generate embeddings
-
-```bash
-python ingest.py
-```
-
-This will:
-
-- Extract text from the PDF
-- Split text into chunks
-- Generate embeddings
-- Create and save the FAISS vector index
-
 ### Start the application
 
 ```bash
-python query.py
+streamlit run app.py
 ```
 
-Example:
+Open the app in your browser, upload a PDF from the sidebar, and ask questions in the chat once it's ingested. Uploaded files are stored in `pdf_qna.db` (SQLite) along with their extracted chunks; the FAISS/BM25 indices live under `vectorstore/`.
+
+### CLI alternative
+
+You can also bulk-ingest PDFs placed in `data/` and chat from the terminal instead of the browser:
+
+```bash
+python ingest.py   # ingests every PDF in data/ into the same store the UI uses
+python query.py     # terminal Q&A loop; type 'exit' to quit
+```
 
 ```text
 Ask a question (or type 'exit'):
@@ -110,8 +99,6 @@ Answer:
 ...
 ```
 
-Type `exit` to quit.
-
 ---
 
 ## 📂 Project Structure
@@ -119,10 +106,13 @@ Type `exit` to quit.
 ```
 pdf-rag-chat/
 │
-├── data/
-├── faiss_index/
+├── data/            # optional: PDFs for the CLI ingest path
+├── vectorstore/      # generated FAISS + BM25 indices (gitignored)
+├── pdf_qna.db        # SQLite: uploaded file bytes + chunk text (gitignored)
+├── storage.py         # SQLite + FAISS/BM25 storage layer
 ├── ingest.py
 ├── query.py
+├── app.py             # Streamlit UI
 ├── requirements.txt
 └── README.md
 ```
@@ -143,13 +133,9 @@ pdf-rag-chat/
 
 ## 🚀 Future Improvements
 
-- Streamlit Web UI
-- Multiple PDF Support
-- Chat History
-- Source Citations
-- Hybrid Search
-- Reranking
-- Local LLM Support (Ollama)
+- Multi-turn conversation memory (follow-up questions using prior chat context)
+- Filter retrieval to a chosen subset of uploaded documents
+- Retrieval/answer quality evaluation
 
 ---
 
