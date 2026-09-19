@@ -3,3 +3,4 @@
 *.db
 vectorstore/
 __pycache__/
+.vscode/settings.json
