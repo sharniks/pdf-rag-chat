@@ -49,7 +49,7 @@ cd pdf-rag-chat
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\Activate
+.\.venv\Scripts\Activate.ps1
 ```
 
 **Linux / macOS**
@@ -65,11 +65,18 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Configure environment variables
+### Choose an LLM: local Ollama (default) or Hugging Face
 
-Create a `.env` file in the project root.
+By default the app answers using a **local Ollama model** — no `.env` file needed, but you must have [Ollama](https://ollama.com) installed, running, and the model pulled:
+
+```bash
+ollama pull llama3.2
+```
+
+To use the **Hugging Face Inference API** instead, create a `.env` file in the project root:
 
 ```text
+USE_LOCAL_LLM=false
 HF_API_TOKEN=your_huggingface_api_token
 ```
 
@@ -106,13 +113,13 @@ Answer:
 ```
 pdf-rag-chat/
 │
-├── data/            # optional: PDFs for the CLI ingest path
-├── vectorstore/      # generated FAISS + BM25 indices (gitignored)
-├── pdf_qna.db        # SQLite: uploaded file bytes + chunk text (gitignored)
-├── storage.py         # SQLite + FAISS/BM25 storage layer
-├── ingest.py
-├── query.py
-├── app.py             # Streamlit UI
+├── data/               # optional: sample PDFs for the CLI ingest path
+├── vectorstore/        # generated FAISS + BM25 indices (gitignored)
+├── pdf_qna.db          # SQLite: uploaded file bytes + chunk text (gitignored)
+├── storage.py          # SQLite + FAISS/BM25 storage layer
+├── ingest.py           # CLI bulk ingestion (shares logic with app.py)
+├── query.py            # retrieval + LLM logic; also a terminal CLI
+├── app.py              # Streamlit UI
 ├── requirements.txt
 └── README.md
 ```
@@ -122,12 +129,14 @@ pdf-rag-chat/
 ## 📚 Concepts Practiced
 
 - Retrieval-Augmented Generation (RAG)
-- Document Loading
-- Text Chunking
-- Embeddings
-- Vector Databases (FAISS)
-- Semantic Search
+- Document Loading & Text Chunking
+- Embeddings & Vector Search (FAISS)
+- Hybrid Retrieval (dense FAISS + BM25 keyword search)
+- Reciprocal Rank Fusion
+- Cross-Encoder Reranking
+- Persistent Storage (SQLite for documents/chunks, FAISS/BM25 for indices)
 - Prompt Engineering
+- Building an Interactive UI (Streamlit)
 
 ---
 
